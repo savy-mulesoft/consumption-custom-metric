@@ -38,7 +38,7 @@ http://www.mulesoft.org/schema/mule/custom-metrics http://www.mulesoft.org/schem
 		<set-variable variableName="upstreamBytes" value="#[sizeOf(payload as Binary)]" doc:name="Measure Upstream Bytes" />
 		
 		<!-- Send metric -->
-		<custom-metrics:send config-ref="customMetricsConfig" metricName="payloadgen_transfer" doc:name="Send Metric">
+		<custom-metrics:send metricName="payloadgen_transfer" doc:name="Send Metric">
 			<custom-metrics:dimensions>
 				<custom-metrics:dimension dimensionName="route" value="payloadGen_bytes" />
 				<custom-metrics:dimension dimensionName="method" value="GET" />
