@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:custom-metrics="http://www.mulesoft.org/schema/mule/custom-metrics"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/custom-metrics http://www.mulesoft.org/schema/mule/custom-metrics/current/mule-custom-metrics.xsd">
+
+	<!-- HTTP Listener Configuration -->
+	<http:listener-config name="httpListener" doc:name="HTTP Listener config">
+		<http:listener-connection host="${http.listener.host}" port="${http.listener.port}" />
+	</http:listener-config>
+	
+	<!-- HTTP Request Configuration for httpbin -->
+	<http:request-config name="httpbinReq" doc:name="HTTP Request configuration">
+		<http:request-connection protocol="${httpbin.protocol}" host="${httpbin.host}" port="${httpbin.port}" />
+	</http:request-config>
+	
+	<!-- Custom Metrics Configuration -->
+	<custom-metrics:config name="customMetricsConfig" doc:name="Custom Metrics Config" />
+
+	<!-- Main Flow -->
+	<flow name="payloadGenBytesFlow" doc:id="payloadGenBytesFlow">
+		<http:listener config-ref="httpListener" path="/payloadGen/bytes/{size}" doc:name="HTTP Listener" />
+		
+		<logger level="INFO" doc:name="Log Request" message="Received request for size: #[attributes.uriParams.size]" />
+
+		<!-- Parse and validate size -->
+		<set-variable variableName="requestedSize" value="#[attributes.uriParams.size as Number]" doc:name="Set Requested Size" />
+
+		<!-- Validate size -->
+		<choice doc:name="Validate Size">
+			<when expression="#[vars.requestedSize <= 0 or vars.requestedSize > 10000000]">
+				<set-payload value='#[{ error: "Invalid size. Must be 1..10000000 bytes." }]' mimeType="application/json" doc:name="Set Error Payload" />
+				<logger level="ERROR" doc:name="Log Validation Error" message="Invalid size requested: #[vars.requestedSize]" />
+				<raise-error type="VALIDATION:INVALID_SIZE" doc:name="Raise Validation Error" />
+			</when>
+		</choice>
+
+		<!-- Start timer -->
+		<set-variable variableName="startTime" value="#[now()]" doc:name="Start Timer" />
+
+		<!-- Call httpbin -->
+		<http:request config-ref="httpbinReq" method="GET" path="/bytes/#{vars.requestedSize}" doc:name="Call httpbin" />
+
+		<!-- Measure upstream bytes -->
+		<set-variable variableName="upstreamBytes" value="#[sizeOf(payload as Binary)]" doc:name="Measure Upstream Bytes" />
+		
+		<logger level="INFO" doc:name="Log Upstream Response" message="Received #[vars.upstreamBytes] bytes from httpbin" />
+
+		<!-- Build JSON response -->
+		<ee:transform doc:name="Build Base64 JSON Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+import toBase64 from dw::core::Binaries
+output application/json
+var bin = payload as Binary
+---
+{
+  requestedSize: vars.requestedSize,
+  upstreamBodyBytes: vars.upstreamBytes,
+  encoding: "base64",
+  data: toBase64(bin)
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+
+		<!-- Compute response size -->
+		<set-variable variableName="responseBytes" value="#[sizeOf(write(payload, 'application/json') as Binary)]" doc:name="Compute Response Size" />
+
+		<!-- Stop timer -->
+		<set-variable variableName="durationMs" value="#[(now() as Number) - (vars.startTime as Number)]" doc:name="Calculate Duration" />
+
+		<!-- Determine size bucket -->
+		<ee:transform doc:name="Set Size Bucket">
+			<ee:message>
+			</ee:message>
+			<ee:variables>
+				<ee:set-variable variableName="sizeBucket"><![CDATA[%dw 2.0
+output application/java
+---
+if (vars.requestedSize < 1024) "1KB"
+else if (vars.requestedSize < 10240) "10KB"
+else if (vars.requestedSize < 102400) "100KB"
+else if (vars.requestedSize < 1048576) "1MB"
+else "10MB"]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+
+		<!-- Send metric -->
+		<custom-metrics:send config-ref="customMetricsConfig" metricName="payloadgen_transfer" doc:name="Send Custom Metric">
+			<custom-metrics:dimensions>
+				<custom-metrics:dimension dimensionName="route" value="payloadGen_bytes" />
+				<custom-metrics:dimension dimensionName="method" value="GET" />
+				<custom-metrics:dimension dimensionName="status" value="200" />
+				<custom-metrics:dimension dimensionName="upstream" value="httpbin" />
+				<custom-metrics:dimension dimensionName="size_bucket" value="#[vars.sizeBucket]" />
+			</custom-metrics:dimensions>
+			<custom-metrics:facts>
+				<custom-metrics:fact factName="requested_bytes" value="#[vars.requestedSize]" />
+				<custom-metrics:fact factName="upstream_body_bytes" value="#[vars.upstreamBytes]" />
+				<custom-metrics:fact factName="response_json_bytes" value="#[vars.responseBytes]" />
+				<custom-metrics:fact factName="duration_ms" value="#[vars.durationMs]" />
+			</custom-metrics:facts>
+		</custom-metrics:send>
+		
+		<logger level="INFO" doc:name="Log Success" message="Successfully processed request. Duration: #[vars.durationMs]ms, Response size: #[vars.responseBytes] bytes" />
+	</flow>
+
+	<!-- Error Handler Flow -->
+	<flow name="errorHandlerFlow" doc:id="errorHandlerFlow">
+		<error-handler>
+			<on-error-propagate type="VALIDATION:INVALID_SIZE" doc:name="Handle Validation Error">
+				<set-payload value='#[{ error: "Invalid size. Must be 1..10000000 bytes." }]' mimeType="application/json" doc:name="Set Error Response" />
+				<set-variable variableName="httpStatus" value="400" doc:name="Set HTTP Status" />
+			</on-error-propagate>
+			<on-error-propagate type="ANY" doc:name="Handle Any Error">
+				<logger level="ERROR" doc:name="Log Error" message="Error occurred: #[error.description]" />
+				<set-payload value='#[{ error: "Internal server error" }]' mimeType="application/json" doc:name="Set Generic Error Response" />
+				<set-variable variableName="httpStatus" value="500" doc:name="Set HTTP Status" />
+			</on-error-propagate>
+		</error-handler>
+	</flow>
+
+</mule>
