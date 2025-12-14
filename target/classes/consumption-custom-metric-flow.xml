@@ -36,7 +36,6 @@ http://www.mulesoft.org/schema/mule/custom-metrics http://www.mulesoft.org/schem
 		<!-- Validate size -->
 		<choice doc:name="Validate Size">
 			<when expression="#[vars.requestedSize <= 0 or vars.requestedSize > 10000000]">
-				<set-payload value='#[{ error: "Invalid size. Must be 1..10000000 bytes." }]' mimeType="application/json" doc:name="Set Error Payload" />
 				<logger level="ERROR" doc:name="Log Validation Error" message="Invalid size requested: #[vars.requestedSize]" />
 				
 				<!-- Send validation error metric -->
@@ -46,49 +45,53 @@ http://www.mulesoft.org/schema/mule/custom-metrics http://www.mulesoft.org/schem
 						<custom-metrics:dimension dimensionName="method" value="GET" />
 						<custom-metrics:dimension dimensionName="status" value="400" />
 						<custom-metrics:dimension dimensionName="upstream" value="httpbin" />
+						<custom-metrics:dimension dimensionName="error_type" value="VALIDATION" />
 					</custom-metrics:dimensions>
 					<custom-metrics:facts>
 						<custom-metrics:fact factName="requested_bytes" value="#[vars.requestedSize]" />
 					</custom-metrics:facts>
 				</custom-metrics:send>
 				
-				<raise-error type="VALIDATION:INVALID_SIZE" doc:name="Raise Validation Error" />
+				<!-- Set 400 response directly -->
+				<set-payload value='#[{ error: "Invalid size. Must be 1..10000000 bytes." }]' mimeType="application/json" doc:name="Set Validation Error Payload" />
+				<set-property propertyName="http.status" value="400" doc:name="Set HTTP 400 Status" />
+				<logger level="INFO" doc:name="Log 400 Response" message="Returning HTTP 400 for invalid size" />
 			</when>
-		</choice>
+			<otherwise>
+				<!-- Start timer -->
+				<set-variable variableName="startTime" value="#[java!java::lang::System::currentTimeMillis()]" doc:name="Start Timer" />
 
-		<!-- Start timer -->
-		<set-variable variableName="startTime" value="#[now()]" doc:name="Start Timer" />
+				<!-- Call httpbin -->
+				<http:request config-ref="httpbinReq" method="GET" path="/bytes/#{vars.requestedSize}" doc:name="Call httpbin" />
 
-		<!-- Call httpbin -->
-		<http:request config-ref="httpbinReq" method="GET" path="/bytes/#{vars.requestedSize}" doc:name="Call httpbin" />
+				<!-- Measure upstream bytes -->
+				<set-variable variableName="upstreamBytes" value="#[sizeOf(payload as Binary)]" doc:name="Measure Upstream Bytes" />
+				
+				<!-- Calculate duration after upstream response -->
+				<set-variable variableName="durationMs" value="#[java!java::lang::System::currentTimeMillis() - vars.startTime]" doc:name="Calculate Duration After Upstream" />
+				
+				<logger level="INFO" doc:name="Log Upstream Response" message="Received #[vars.upstreamBytes] bytes from httpbin in #[vars.durationMs]ms" />
 
-		<!-- Measure upstream bytes -->
-		<set-variable variableName="upstreamBytes" value="#[sizeOf(payload as Binary)]" doc:name="Measure Upstream Bytes" />
-		
-		<!-- Calculate duration after upstream response -->
-		<set-variable variableName="durationMs" value="#[(now() as Number) - (vars.startTime as Number)]" doc:name="Calculate Duration After Upstream" />
-		
-		<logger level="INFO" doc:name="Log Upstream Response" message="Received #[vars.upstreamBytes] bytes from httpbin in #[vars.durationMs]ms" />
+				<!-- Send metric immediately after measuring upstream payload -->
+				<custom-metrics:send config-ref="customMetricsConfig" metricName="payloadgen_transfer" doc:name="Send Success Metric">
+					<custom-metrics:dimensions>
+						<custom-metrics:dimension dimensionName="route" value="payloadGen_bytes" />
+						<custom-metrics:dimension dimensionName="method" value="GET" />
+						<custom-metrics:dimension dimensionName="status" value="200" />
+						<custom-metrics:dimension dimensionName="upstream" value="httpbin" />
+						<custom-metrics:dimension dimensionName="error_type" value="NONE" />
+					</custom-metrics:dimensions>
+					<custom-metrics:facts>
+						<custom-metrics:fact factName="requested_bytes" value="#[vars.requestedSize]" />
+						<custom-metrics:fact factName="upstream_body_bytes" value="#[vars.upstreamBytes]" />
+						<custom-metrics:fact factName="duration_ms" value="#[vars.durationMs]" />
+					</custom-metrics:facts>
+				</custom-metrics:send>
 
-		<!-- Send metric immediately after measuring upstream payload -->
-		<custom-metrics:send config-ref="customMetricsConfig" metricName="payloadgen_transfer" doc:name="Send Success Metric">
-			<custom-metrics:dimensions>
-				<custom-metrics:dimension dimensionName="route" value="payloadGen_bytes" />
-				<custom-metrics:dimension dimensionName="method" value="GET" />
-				<custom-metrics:dimension dimensionName="status" value="200" />
-				<custom-metrics:dimension dimensionName="upstream" value="httpbin" />
-			</custom-metrics:dimensions>
-			<custom-metrics:facts>
-				<custom-metrics:fact factName="requested_bytes" value="#[vars.requestedSize]" />
-				<custom-metrics:fact factName="upstream_body_bytes" value="#[vars.upstreamBytes]" />
-				<custom-metrics:fact factName="duration_ms" value="#[vars.durationMs]" />
-			</custom-metrics:facts>
-		</custom-metrics:send>
-
-		<!-- Build JSON response (after metric is sent) -->
-		<ee:transform doc:name="Build Base64 JSON Response">
-			<ee:message>
-				<ee:set-payload><![CDATA[%dw 2.0
+				<!-- Build JSON response (after metric is sent) -->
+				<ee:transform doc:name="Build Base64 JSON Response">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
 import toBase64 from dw::core::Binaries
 output application/json
 var bin = payload as Binary
@@ -99,16 +102,33 @@ var bin = payload as Binary
   encoding: "base64",
   data: toBase64(bin)
 }]]></ee:set-payload>
-			</ee:message>
-		</ee:transform>
-		
-		<logger level="INFO" doc:name="Log Success" message="Successfully processed request. Duration: #[vars.durationMs]ms, Upstream bytes: #[vars.upstreamBytes]" />
+					</ee:message>
+				</ee:transform>
+				
+				<!-- Measure response JSON size and send final metric -->
+				<set-variable variableName="responseBytes" value="#[sizeOf(write(payload, 'application/json') as Binary)]" doc:name="Measure Response Size" />
+				
+				<custom-metrics:send config-ref="customMetricsConfig" metricName="payloadgen_transfer_response" doc:name="Send Response Size Metric">
+					<custom-metrics:dimensions>
+						<custom-metrics:dimension dimensionName="route" value="payloadGen_bytes" />
+						<custom-metrics:dimension dimensionName="method" value="GET" />
+						<custom-metrics:dimension dimensionName="status" value="200" />
+						<custom-metrics:dimension dimensionName="upstream" value="httpbin" />
+					</custom-metrics:dimensions>
+					<custom-metrics:facts>
+						<custom-metrics:fact factName="requested_bytes" value="#[vars.requestedSize]" />
+						<custom-metrics:fact factName="upstream_body_bytes" value="#[vars.upstreamBytes]" />
+						<custom-metrics:fact factName="response_json_bytes" value="#[vars.responseBytes]" />
+						<custom-metrics:fact factName="duration_ms" value="#[vars.durationMs]" />
+					</custom-metrics:facts>
+				</custom-metrics:send>
+				
+				<logger level="INFO" doc:name="Log Success" message="Successfully processed request. Duration: #[vars.durationMs]ms, Upstream: #[vars.upstreamBytes] bytes, Response: #[vars.responseBytes] bytes" />
+			</otherwise>
+		</choice>
 		
 		<!-- Error Handler within Flow -->
 		<error-handler>
-			<on-error-propagate type="VALIDATION:INVALID_SIZE" doc:name="Handle Validation Error">
-				<set-payload value='#[{ error: "Invalid size. Must be 1..10000000 bytes." }]' mimeType="application/json" doc:name="Set Validation Error Response" />
-			</on-error-propagate>
 			<on-error-propagate type="HTTP:*" doc:name="Handle Upstream HTTP Error">
 				<logger level="ERROR" doc:name="Log Upstream Error" message="Upstream error: #[error.description]" />
 				
@@ -119,13 +139,16 @@ var bin = payload as Binary
 						<custom-metrics:dimension dimensionName="method" value="GET" />
 						<custom-metrics:dimension dimensionName="status" value="502" />
 						<custom-metrics:dimension dimensionName="upstream" value="httpbin" />
+						<custom-metrics:dimension dimensionName="error_type" value="HTTP" />
 					</custom-metrics:dimensions>
 					<custom-metrics:facts>
 						<custom-metrics:fact factName="requested_bytes" value="#[vars.requestedSize]" />
+						<custom-metrics:fact factName="upstream_status_code" value="#[error.errorMessage.attributes.statusCode default 0]" />
 					</custom-metrics:facts>
 				</custom-metrics:send>
 				
 				<set-payload value='#[{ error: "Upstream service error" }]' mimeType="application/json" doc:name="Set Upstream Error Response" />
+				<set-property propertyName="http.status" value="502" doc:name="Set HTTP 502 Status" />
 			</on-error-propagate>
 			<on-error-propagate type="ANY" doc:name="Handle Any Other Error">
 				<logger level="ERROR" doc:name="Log Generic Error" message="Runtime error: #[error.description]" />
@@ -137,6 +160,7 @@ var bin = payload as Binary
 						<custom-metrics:dimension dimensionName="method" value="GET" />
 						<custom-metrics:dimension dimensionName="status" value="500" />
 						<custom-metrics:dimension dimensionName="upstream" value="httpbin" />
+						<custom-metrics:dimension dimensionName="error_type" value="RUNTIME" />
 					</custom-metrics:dimensions>
 					<custom-metrics:facts>
 						<custom-metrics:fact factName="requested_bytes" value="#[vars.requestedSize default 0]" />
@@ -144,6 +168,7 @@ var bin = payload as Binary
 				</custom-metrics:send>
 				
 				<set-payload value='#[{ error: "Internal server error" }]' mimeType="application/json" doc:name="Set Generic Error Response" />
+				<set-property propertyName="http.status" value="500" doc:name="Set HTTP 500 Status" />
 			</on-error-propagate>
 		</error-handler>
 	</flow>
